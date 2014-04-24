@@ -537,6 +537,8 @@ class Client(object):
                                     key=self.opts.get('s3.key', None),
                                     keyid=self.opts.get('s3.keyid', None),
                                     service_url=self.opts.get('s3.service_url',
+                                                              None)
+                                    verify_ssl=self.opts.get('s3.verify_ssl',
                                                               None))
                 return dest
             except Exception as ex:

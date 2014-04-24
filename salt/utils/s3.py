@@ -25,7 +25,8 @@ log = logging.getLogger(__name__)
 
 def query(key, keyid, method='GET', params=None, headers=None,
           requesturl=None, return_url=False, bucket=None, service_url=None,
-          path=None, return_bin=False, action=None, local_file=None):
+          path=None, return_bin=False, action=None, local_file=None,
+          verify_ssl=True):
     '''
     Perform a query against an S3-like API. This function requires that a
     secret key and the id for that key are passed in. For instance:
@@ -140,7 +141,8 @@ def query(key, keyid, method='GET', params=None, headers=None,
     log.debug('    Authorization: {0}'.format(headers['Authorization']))
 
     try:
-        result = requests.request(method, requesturl, headers=headers)
+        result = requests.request(method, requesturl, headers=headers,
+                                  verify=verify_ssl)
         response = result.content
     except requests.exceptions.HTTPError as exc:
         log.error('There was an error::')
