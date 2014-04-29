@@ -55,12 +55,8 @@ def ext_pillar(minion_id, pillar, bucket, key, keyid, service_url, verify_ssl,
     branch = 'base'
     s3_creds = S3Credentials(key, keyid, bucket, service_url, verify_ssl)
 
-    log.debug('ext_pillar called: Minion id is %s, Bucket is: %s, root is %s, key is %s, keyid is %s, service_url is %s, verify_ssl is %s, multiple_env is %s, environment is %s',
-      minion_id, bucket, root, key, keyid, service_url, verify_ssl, multiple_env, environment)
-
     # normpath is needed to remove appended '/' if root is empty string.
     pillar_dir = os.path.normpath(os.path.join(_get_cache_dir(), branch, bucket, root))
-
 
     if __opts__['pillar_roots'].get(branch, []) == [pillar_dir]:
         return {}
@@ -159,7 +155,7 @@ def _refresh_buckets_cache_file(creds, cache_file, multiple_env, environment,
                 keyid=creds.keyid,
                 bucket=creds.bucket,
                 service_url=creds.service_url,
-                #verify_ssl=creds.verify_ssl,
+                verify_ssl=creds.verify_ssl,
                 return_bin=False)
 
     # grab only the files/dirs in the root directory if specified
@@ -313,6 +309,6 @@ def _get_file_from_s3(creds, metadata, saltenv, bucket_name, path, cached_file_p
         bucket=bucket_name,
         service_url=creds.service_url,
         path=urllib.quote(path),
-        local_file=cached_file_path
-#        verify_ssl=creds.verify_ssl
+        local_file=cached_file_path,
+        verify_ssl=creds.verify_ssl
     )
