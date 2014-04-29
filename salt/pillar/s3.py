@@ -1,5 +1,57 @@
 # -*- coding: utf-8 -*-
 '''
+Copy pillar data from a bucket in Amazon S3
+
+The S3 pillar can be configured in the master config file with the following
+options
+
+.. code-block:: yaml
+
+    ext_pillar:
+      - s3:
+          bucket: my.fancy.pillar.bucket
+          keyid: KASKFJWAKJASJKDAJKSD
+          key: ksladfDLKDALSFKSD93q032sdDasdfasdflsadkf
+          multiple_env: False
+          environment: base
+          verify_ssl: True
+          service_url: s3.amazonaws.com
+
+The `bucket=` parameter specifies the target S3 bucket. It is required.
+
+The `keyid=` parameter specifies the key id to use when access the S3 bucket. It
+is required.
+
+The `key=` parameter specifies the key to use when access the S3 bucket. It
+is required.
+
+The `multiple_env=` defaults to False. It specifies whether the pillar should
+interpret top level folders as pillar environments (see mode section below).
+
+The `environment=` defaults to 'base'. It specifies which environment the bucket
+represents when in single environments mode (see mode section below). It is
+ignored if multiple_env is True.
+
+The `verify_ssl=` parameter defaults to True. It specifies whether to check for
+valid S3 SSL certificates. *NOTE* If you use bucket names with periods, this
+must be set to False else an invalid certificate error will be thrown (issue
+#12200).
+
+The `service_url=` parameter defaults to 's3.amazonaws.com'. It specifies the
+base url to use for accessing S3.
+
+
+This pillar can operate in two modes, single environment per bucket or multiple
+environments per bucket.
+
+Single environment mode must have this bucket structure::
+
+s3://<bucket name>/<files>
+
+Multiple environment mode must have this bucket structure::
+
+s3://<bucket name>/<environment>/<files>
+
 '''
 
 # Import python libs
@@ -10,8 +62,6 @@ import hashlib
 import pickle
 import urllib
 from copy import deepcopy
-
-from pprint import pprint
 
 # Import salt libs
 from salt.pillar import Pillar
@@ -46,22 +96,21 @@ def __init__( __opts__ ):
         os.makedirs(cache_dir)
 
 
-def ext_pillar(minion_id, pillar, bucket, key, keyid, service_url, verify_ssl,
-               multiple_env=False, environment='base', root=''):
+def ext_pillar(minion_id, pillar, bucket, key, keyid, verify_ssl,
+               multiple_env=False, environment='base', service_url=None):
     '''
     Execute a command and read the output as YAML
     '''
 
-    branch = 'base'
     s3_creds = S3Credentials(key, keyid, bucket, service_url, verify_ssl)
 
     # normpath is needed to remove appended '/' if root is empty string.
-    pillar_dir = os.path.normpath(os.path.join(_get_cache_dir(), branch, bucket, root))
+    pillar_dir = os.path.normpath(os.path.join(_get_cache_dir(), environment, bucket))
 
-    if __opts__['pillar_roots'].get(branch, []) == [pillar_dir]:
+    if __opts__['pillar_roots'].get(environment, []) == [pillar_dir]:
         return {}
 
-    metadata = _init(s3_creds, root, multiple_env, environment)
+    metadata = _init(s3_creds, multiple_env, environment)
 
     if _s3_sync_on_update:
         # sync the buckets to the local cache
@@ -79,16 +128,16 @@ def ext_pillar(minion_id, pillar, bucket, key, keyid, service_url, verify_ssl,
 
     opts = deepcopy(__opts__)
 
-    opts['pillar_roots'][branch] = [pillar_dir]
+    opts['pillar_roots'][environment] = [pillar_dir]
 
-    pil = Pillar(opts, __grains__, minion_id, branch)
+    pil = Pillar(opts, __grains__, minion_id, environment)
 
     compiled_pillar = pil.compile_pillar()
 
     return compiled_pillar
 
 
-def _init(creds, root, multiple_env, environment):
+def _init(creds, multiple_env, environment):
     '''
     Connect to S3 and download the metadata for each file in all buckets
     specified and cache the data to disk.
@@ -103,7 +152,7 @@ def _init(creds, root, multiple_env, environment):
     else:
         # bucket files cache expired
         return _refresh_buckets_cache_file(creds, cache_file, multiple_env,
-                                           environment, root)
+                                           environment)
 
 
 def _get_cache_dir():
@@ -141,8 +190,7 @@ def _get_buckets_cache_filename():
     return os.path.join(cache_dir, 'buckets_files.cache')
 
 
-def _refresh_buckets_cache_file(creds, cache_file, multiple_env, environment,
-                                root):
+def _refresh_buckets_cache_file(creds, cache_file, multiple_env, environment):
     '''
     Retrieve the content of all buckets and cache the metadata to the buckets
     cache file
@@ -158,33 +206,21 @@ def _refresh_buckets_cache_file(creds, cache_file, multiple_env, environment,
                 verify_ssl=creds.verify_ssl,
                 return_bin=False)
 
-    # grab only the files/dirs in the root directory if specified
-    # otherwise get everything that has a key
-    def __get_pillar_files_from_s3_meta(s3_meta, root):
-        if root != '':
-          return filter(lambda k: 'Key' in k and k['Key'].startswith(root),
-                        s3_meta)
-        else:
-          return filter(lambda k: 'Key' in k, s3_meta)
+    # grab only the files/dirs in the bucket
+    def __get_pillar_files_from_s3_meta(s3_meta):
+        return filter(lambda k: 'Key' in k, s3_meta)
 
     # pull out the environment dirs (eg. the root dirs)
-    def __get_pillar_environments_from_s3_meta(s3_meta, root):
-        if root != '':
-            environments = map(lambda k: (os.path.dirname(k['Key']
-                                          .replace(root + '/', ''))
-                                          .split('/', 1))[0], files)
-        else:
-            environments = map(lambda k: (os.path.dirname(k['Key'])
-                               .split('/', 1))[0], files)
+    def __get_pillar_environments_from_s3_meta(s3_meta):
+        environments = map(lambda k: (os.path.dirname(k['Key'])
+                           .split('/', 1))[0], files)
 
         return set(environments)
-
 
     log.debug('Refreshing S3 buckets pillar cache file')
 
     metadata = {}
     bucket_name = creds.bucket
-
 
     if not multiple_env:
         # Single environment per bucket
@@ -195,7 +231,7 @@ def _refresh_buckets_cache_file(creds, cache_file, multiple_env, environment,
 
         # s3 query returned something
         if s3_meta:
-            bucket_files[bucket_name] = __get_pillar_files_from_s3_meta(s3_meta, root)
+            bucket_files[bucket_name] = __get_pillar_files_from_s3_meta(s3_meta)
 
             metadata[environment] = bucket_files
 
@@ -206,15 +242,13 @@ def _refresh_buckets_cache_file(creds, cache_file, multiple_env, environment,
 
         # s3 query returned data
         if s3_meta:
-            files = __get_pillar_files_from_s3_meta(s3_meta, root)
-            environments = __get_pillar_environments_from_s3_meta(s3_meta, root)
+            files = __get_pillar_files_from_s3_meta(s3_meta)
+            environments = __get_pillar_environments_from_s3_meta(s3_meta)
 
             # pull out the files for the environment
             for saltenv in environments:
-                # grab only files/dirs that match this saltenv. Add the root
-                # prefix to the path if it exists
-                env_path = root + saltenv
-                env_files = filter(lambda k: k['Key'].startswith(env_path), files)
+                # grab only files/dirs that match this saltenv.
+                env_files = filter(lambda k: k['Key'].startswith(saltenv), files)
 
                 if saltenv not in metadata:
                     metadata[saltenv] = {}
