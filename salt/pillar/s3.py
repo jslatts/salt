@@ -21,11 +21,16 @@ import salt.utils.s3 as s3
 # Set up logging
 log = logging.getLogger(__name__)
 
-# Define the module's virtual name
-#__virtualname__ = 's3'
-
 _s3_cache_expire = 30  # cache for 30 seconds
 _s3_sync_on_update = True  # sync cache on update rather than jit
+
+class S3Credentials(object):
+    def __init__(self, key, keyid, bucket, service_url, verify_ssl=True):
+        self.key = key
+        self.keyid = keyid
+        self.bucket = bucket
+        self.service_url = service_url
+        self.verify_ssl = verify_ssl
 
 
 def __init__( __opts__ ):
@@ -41,25 +46,28 @@ def __init__( __opts__ ):
         os.makedirs(cache_dir)
 
 
-def ext_pillar(minion_id, pillar, bucket, root=''):
+def ext_pillar(minion_id, pillar, bucket, key, keyid, service_url, verify_ssl,
+               multiple_env=False, environment='base', root=''):
     '''
     Execute a command and read the output as YAML
     '''
-    branch = 'base'
 
-    log.debug('ext_pillar called: Bucket is: %s, root is %s', bucket, root)
+    branch = 'base'
+    s3_creds = S3Credentials(key, keyid, bucket, service_url, verify_ssl)
+
+    log.debug('ext_pillar called: Minion id is %s, Bucket is: %s, root is %s, key is %s, keyid is %s, service_url is %s, verify_ssl is %s, multiple_env is %s, environment is %s',
+      minion_id, bucket, root, key, keyid, service_url, verify_ssl, multiple_env, environment)
 
     # normpath is needed to remove appended '/' if root is empty string.
-    pillar_dir = os.path.normpath(os.path.join(_get_cache_dir(), root))
+    pillar_dir = os.path.normpath(os.path.join(_get_cache_dir(), branch, bucket, root))
+
 
     if __opts__['pillar_roots'].get(branch, []) == [pillar_dir]:
         return {}
 
-    metadata = _init()
+    metadata = _init(s3_creds, root, multiple_env, environment)
 
     if _s3_sync_on_update:
-        key, keyid, service_url = _get_s3_key()
-
         # sync the buckets to the local cache
         log.info('Syncing local pillar cache from S3...')
         for saltenv, env_meta in metadata.iteritems():
@@ -67,9 +75,8 @@ def ext_pillar(minion_id, pillar, bucket, root=''):
                 for file_path in files:
                     cached_file_path = _get_cached_file_name(bucket, saltenv, file_path)
                     log.info('{0} - {1} : {2}'.format(bucket, saltenv, file_path))
-
                     # load the file from S3 if it's not in the cache or it's old
-                    _get_file_from_s3(metadata, saltenv, bucket, file_path, cached_file_path)
+                    _get_file_from_s3(s3_creds, metadata, saltenv, bucket, file_path, cached_file_path)
 
         log.info('Sync local pillar cache from S3 completed.')
 
@@ -82,27 +89,10 @@ def ext_pillar(minion_id, pillar, bucket, root=''):
 
     compiled_pillar = pil.compile_pillar()
 
-    pprint(opts)
-    pprint(compiled_pillar)
-
     return compiled_pillar
 
 
-def _get_s3_key():
-    '''
-    Get AWS keys from pillar or config
-    '''
-
-    key = __opts__['s3.key'] if 's3.key' in __opts__ else None
-    keyid = __opts__['s3.keyid'] if 's3.keyid' in __opts__ else None
-    service_url = __opts__['s3.service_url'] \
-        if 's3.service_url' in __opts__ \
-        else None
-
-    return key, keyid, service_url
-
-
-def _init():
+def _init(creds, root, multiple_env, environment):
     '''
     Connect to S3 and download the metadata for each file in all buckets
     specified and cache the data to disk.
@@ -116,7 +106,8 @@ def _init():
         return _read_buckets_cache_file(cache_file)
     else:
         # bucket files cache expired
-        return _refresh_buckets_cache_file(cache_file)
+        return _refresh_buckets_cache_file(creds, cache_file, multiple_env,
+                                           environment, root)
 
 
 def _get_cache_dir():
@@ -154,60 +145,80 @@ def _get_buckets_cache_filename():
     return os.path.join(cache_dir, 'buckets_files.cache')
 
 
-def _refresh_buckets_cache_file(cache_file):
+def _refresh_buckets_cache_file(creds, cache_file, multiple_env, environment,
+                                root):
     '''
     Retrieve the content of all buckets and cache the metadata to the buckets
     cache file
     '''
 
-    log.debug('Refreshing S3 buckets pillar cache file')
-
-    key, keyid, service_url = _get_s3_key()
-    metadata = {}
-
     # helper s3 query function
-    def __get_s3_meta(bucket, key=key, keyid=keyid):
+    def __get_s3_meta(bucket):
         return s3.query(
-                key=key,
-                keyid=keyid,
-                bucket=bucket,
-                service_url=service_url,
+                key=creds.key,
+                keyid=creds.keyid,
+                bucket=creds.bucket,
+                service_url=creds.service_url,
+                #verify_ssl=creds.verify_ssl,
                 return_bin=False)
 
-    if _is_env_per_bucket():
+    # grab only the files/dirs in the root directory if specified
+    # otherwise get everything that has a key
+    def __get_pillar_files_from_s3_meta(s3_meta, root):
+        if root != '':
+          return filter(lambda k: 'Key' in k and k['Key'].startswith(root),
+                        s3_meta)
+        else:
+          return filter(lambda k: 'Key' in k, s3_meta)
+
+    # pull out the environment dirs (eg. the root dirs)
+    def __get_pillar_environments_from_s3_meta(s3_meta, root):
+        if root != '':
+            environments = map(lambda k: (os.path.dirname(k['Key']
+                                          .replace(root + '/', ''))
+                                          .split('/', 1))[0], files)
+        else:
+            environments = map(lambda k: (os.path.dirname(k['Key'])
+                               .split('/', 1))[0], files)
+
+        return set(environments)
+
+
+    log.debug('Refreshing S3 buckets pillar cache file')
+
+    metadata = {}
+    bucket_name = creds.bucket
+
+
+    if not multiple_env:
         # Single environment per bucket
-        for saltenv, buckets in _get_buckets().items():
-            bucket_files = {}
-            for bucket_name in buckets:
-                s3_meta = __get_s3_meta(bucket_name)
+        log.debug('Single environment per bucket mode')
 
-                # s3 query returned nothing
-                if not s3_meta:
-                    continue
+        bucket_files = {}
+        s3_meta = __get_s3_meta(bucket_name)
 
-                # grab only the files/dirs
-                bucket_files[bucket_name] = filter(lambda k: 'Key' in k, s3_meta)
+        # s3 query returned something
+        if s3_meta:
+            bucket_files[bucket_name] = __get_pillar_files_from_s3_meta(s3_meta, root)
 
-            metadata[saltenv] = bucket_files
+            metadata[environment] = bucket_files
 
     else:
         # Multiple environments per buckets
-        for bucket_name in _get_buckets():
-            s3_meta = __get_s3_meta(bucket_name)
+        log.debug('Multiple environment per bucket mode')
+        s3_meta = __get_s3_meta(bucket_name)
 
-            # s3 query returned nothing
-            if not s3_meta:
-                continue
-
-            # pull out the environment dirs (eg. the root dirs)
-            files = filter(lambda k: 'Key' in k, s3_meta)
-            environments = map(lambda k: (os.path.dirname(k['Key']).split('/', 1))[0], files)
-            environments = set(environments)
+        # s3 query returned data
+        if s3_meta:
+            files = __get_pillar_files_from_s3_meta(s3_meta, root)
+            environments = __get_pillar_environments_from_s3_meta(s3_meta, root)
 
             # pull out the files for the environment
             for saltenv in environments:
-                # grab only files/dirs that match this saltenv
-                env_files = filter(lambda k: k['Key'].startswith(saltenv), files)
+                # grab only files/dirs that match this saltenv. Add the root
+                # prefix to the path if it exists
+                env_path = root + saltenv
+                env_files = filter(lambda k: k['Key'].startswith(env_path), files)
 
                 if saltenv not in metadata:
                     metadata[saltenv] = {}
@@ -217,6 +228,7 @@ def _refresh_buckets_cache_file(cache_file):
 
                 metadata[saltenv][bucket_name] += env_files
 
+
     # write the metadata to disk
     if os.path.isfile(cache_file):
         os.remove(cache_file)
@@ -225,8 +237,6 @@ def _refresh_buckets_cache_file(cache_file):
 
     with salt.utils.fopen(cache_file, 'w') as fp_:
         pickle.dump(metadata, fp_)
-
-    pprint(metadata)
 
     return metadata
 
@@ -277,15 +287,7 @@ def _find_file_meta(metadata, bucket_name, saltenv, path):
             return item_meta
 
 
-def _get_buckets():
-    '''
-    Return the configuration buckets
-    '''
-
-    return __opts__['s3.buckets'] if 's3.buckets' in __opts__ else {}
-
-
-def _get_file_from_s3(metadata, saltenv, bucket_name, path, cached_file_path):
+def _get_file_from_s3(creds, metadata, saltenv, bucket_name, path, cached_file_path):
     '''
     Checks the local cache for the file, if it's old or missing go grab the
     file from S3 and update the cache
@@ -305,37 +307,12 @@ def _get_file_from_s3(metadata, saltenv, bucket_name, path, cached_file_path):
             return
 
     # ... or get the file from S3
-    key, keyid, service_url = _get_s3_key()
     s3.query(
-        key=key,
-        keyid=keyid,
+        key=creds.key,
+        keyid=creds.keyid,
         bucket=bucket_name,
-        service_url=service_url,
+        service_url=creds.service_url,
         path=urllib.quote(path),
         local_file=cached_file_path
+#        verify_ssl=creds.verify_ssl
     )
-
-
-def _trim_env_off_path(paths, saltenv, trim_slash=False):
-    '''
-    Return a list of file paths with the saltenv directory removed
-    '''
-    env_len = None if _is_env_per_bucket() else len(saltenv) + 1
-    slash_len = -1 if trim_slash else None
-
-    return map(lambda d: d[env_len:slash_len], paths)
-
-
-def _is_env_per_bucket():
-    '''
-    Return the configuration mode, either buckets per environment or a list of
-    buckets that have environment dirs in their root
-    '''
-
-    buckets = _get_buckets()
-    if isinstance(buckets, dict):
-        return True
-    elif isinstance(buckets, list):
-        return False
-    else:
-        raise ValueError('Incorrect s3.buckets type given in config')
